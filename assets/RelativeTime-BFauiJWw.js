@@ -1,0 +1,1 @@
+import{V as e}from"./toast-BQyZ1Bgi.js";import{a as t,i as n}from"./format-C0U-N9ec.js";import{t as r}from"./useNow-BkasE5UI.js";var i=e();function a({date:e,className:a}){let o=r(3e4),s=t(),c=n(e);return Number.isNaN(c.getTime())?null:(0,i.jsx)(`time`,{className:a,dateTime:c.toISOString(),title:s.dateTime(c),children:s.relative(c,o)})}export{a as t};
