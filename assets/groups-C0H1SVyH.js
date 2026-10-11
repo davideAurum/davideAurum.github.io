@@ -1,0 +1,1 @@
+function e(e,t){if(t.groupIds===`all`)return[...e];let n=new Map(e.map(e=>[e.id,e])),r=[...new Set(t.groupIds)].flatMap(e=>n.has(e)?[n.get(e)]:[]);return r.length>0||e.length===0?r:[...e]}function t(e,t){return e.groupLayout!==`columns`||e.groupColumns===`auto`?1:Math.min(e.groupSpans[t]??1,e.groupColumns)}export{e as n,t};
