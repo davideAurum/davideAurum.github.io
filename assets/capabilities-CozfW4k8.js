@@ -1,0 +1,1 @@
+var e=Object.freeze({accounts:!0,googleAccounts:!1,appPasswordAccounts:!1,calendar:!1,mail:!1,vault:!1,browserBookmarkImport:!1,siteMetaFetch:!1,serverSearchSuggestions:!1}),t=Object.freeze(new Set([`calendar`,`mail`]));function n(e){return!t.has(e)}var r=`Not available in the browser-only build.`;export{n as i,r as n,t as r,e as t};
