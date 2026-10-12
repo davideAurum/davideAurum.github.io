@@ -1,0 +1,1 @@
+var e=`http://127.0.0.1:5757`,t=/^(?:[a-z0-9-]+\.)+localhost$/;function n(e){return e===`localhost`||e===`127.0.0.1`||e===`[::1]`||t.test(e)}export{n,e as t};

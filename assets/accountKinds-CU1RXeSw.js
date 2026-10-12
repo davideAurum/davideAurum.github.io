@@ -1,1 +1,0 @@
-import{G as e}from"./capabilities-CC_zX0o8.js";import{Hn as t,Mn as n}from"./index-iT7CEX_K.js";var r=Object.freeze({google:`Google`,microsoft:`Outlook.com`,yahoo:`Yahoo`,caldav:`CalDAV`,imap:`IMAP mail`}),i=Object.freeze({calendar:`Calendar`,mail:`Mail`}),a=Object.freeze({calendar:t,mail:n});function o(t){return e(t)}export{o as i,a as n,i as r,r as t};
