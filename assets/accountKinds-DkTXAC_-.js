@@ -1,1 +1,0 @@
-import{ut as e}from"./preload-helper-0Zs1ToiL.js";import{Nn as t,wn as n}from"./index-CJ14lbsa.js";var r=Object.freeze({google:`Google`,microsoft:`Outlook.com`,yahoo:`Yahoo`,caldav:`CalDAV`,imap:`IMAP mail`}),i=Object.freeze({calendar:`Calendar`,mail:`Mail`}),a=Object.freeze({calendar:t,mail:n});function o(t){return e(t)}export{o as i,a as n,i as r,r as t};
