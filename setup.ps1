@@ -49,7 +49,8 @@
 
 .PARAMETER NoHomebaseCopy
     Passed to install-autostart.ps1: on a PC that ran Homebase, start Portly from scratch instead
-    of copying Homebase's data and HOMEBASE_* variables (Homebase's task is still removed).
+    of copying Homebase's data and HOMEBASE_* variables (Homebase's task is still removed). Later
+    runs without it do not copy the variables either.
 
 .PARAMETER SkipAutostart
     Do not register the scheduled task and native host (start Portly with scripts\start.ps1).
@@ -268,6 +269,26 @@ function Get-SetupOwnCheckout {
     return $null
 }
 
+# The branch and last commit of a checkout ("main at 1a2b3c4 from 2026-10-01"), or $null.
+function Get-SetupCheckoutCommit {
+    param([Parameter(Mandatory)][string]$Path)
+    $git = Get-SetupCommand 'git.exe'
+    if ($null -eq $git) { return $null }
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $branch = "$(& $git.Source -C $Path rev-parse --abbrev-ref HEAD 2>$null)".Trim()
+        $last = "$(& $git.Source -C $Path log -1 '--format=%h from %cs' 2>$null)".Trim()
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrEmpty($last)) { return $null }
+        if ([string]::IsNullOrEmpty($branch)) { return $last }
+        return "$branch at $last"
+    } catch {
+        return $null
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+}
+
 # Clones (or reuses) -InstallDir and runs its scripts\setup.ps1 with the same options.
 function Invoke-SetupFromClone {
     $target = [System.IO.Path]::GetFullPath($InstallDir)
@@ -278,7 +299,11 @@ function Invoke-SetupFromClone {
         if (-not (Test-Path -LiteralPath (Join-Path $target 'scripts\setup.ps1') -PathType Leaf)) {
             throw "The checkout in $target is older than this script. Update it (git -C ""$target"" pull) and run this again."
         }
-        Write-SetupOk "Using the existing checkout in $target as it is (to update it later: git -C ""$target"" pull, then portly --rebuild)"
+        Write-SetupOk "Found an existing checkout in $target. Setup uses its code as it is and does not update it."
+        $commit = Get-SetupCheckoutCommit -Path $target
+        if ($null -ne $commit) { Write-SetupInfo "Its code: $commit" }
+        Write-SetupInfo "To set up the newest code instead: git -C ""$target"" pull, then run setup again."
+        Write-SetupInfo "To update it later: git -C ""$target"" pull, then portly --rebuild."
     } elseif ((Test-Path -LiteralPath $target) -and @(Get-ChildItem -LiteralPath $target -Force).Count -gt 0) {
         throw "$target exists and is not an empty folder or a Portly checkout. Pass -InstallDir with another folder."
     } else {
