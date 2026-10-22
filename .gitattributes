@@ -1,0 +1,3 @@
+# Portly (scripts\publish-static.ps1): install.ps1 and setup.ps1 are published byte for byte (CRLF endings).
+*.ps1 -text
+*.woff2 binary

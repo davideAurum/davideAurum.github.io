@@ -5,13 +5,18 @@
 
 .DESCRIPTION
     1. Installs what is missing with winget: Git (only when the code must be cloned) and Node.js
-       LTS (24 or newer). Upgrades npm when it is older than 11.10 (package.json requires it).
+       24, the major package.json pins (winget's OpenJS.NodeJS.24, or OpenJS.NodeJS.LTS while that
+       still is 24). A PC with another Node.js major stops here with what to do, naming the
+       winget id that carries 24 today. Upgrades npm when it is older than 11.10 (package.json
+       requires it).
     2. Gets the code: when this script runs from a Portly checkout it uses that checkout;
        otherwise (for example `irm <url> | iex`) it clones -RepoUrl into -InstallDir and runs
        that checkout's copy of this script, so the rest always
        matches the code being installed. An existing checkout in -InstallDir is reused as it is.
     3. With -PagesUrl: saves the Pages site's address as the user environment variable
-       PORTLY_PAGES_URL (or removes it with -PagesUrl off) before Portly is started.
+       PORTLY_PAGES_URL (or removes it with -PagesUrl off) before Portly is started. With
+       -RemoteOrigin: saves the address your other PCs use (through a reverse proxy on this PC,
+       docs\setup\other-pcs.md) as PORTLY_REMOTE_ORIGIN (or removes it with -RemoteOrigin off).
     4. npm ci (exactly the locked dependencies; install scripts stay disabled by .npmrc).
     5. npm run build (web\dist, the page the server serves).
     6. scripts\install-autostart.ps1: the Portly Server scheduled task and the native host the
@@ -44,6 +49,15 @@
     variable: new tabs then open Portly on this PC. Without -PagesUrl the variable is left as it
     is (unset on a new PC).
 
+.PARAMETER RemoteOrigin
+    The address your other PCs use to reach Portly on this PC, given by a reverse proxy you run
+    here such as Tailscale Serve, for example https://<pc>.<tailnet>.ts.net (docs\setup\other-pcs.md).
+    Saved as the user environment variable PORTLY_REMOTE_ORIGIN before Portly is started, so it
+    also listens for the proxy on the port after its own (5758 by default) and lets each PC in
+    once you approve it in Settings -> Devices. 'off' removes the variable (and PORTLY_REMOTE_PORT).
+    Without -RemoteOrigin the variable is left as it is (unset on a new PC: Portly listens on this
+    PC only). On an installed PC add -Trigger Logon when you use Logon mode: the task is replaced.
+
 .PARAMETER Trigger
     Passed to install-autostart.ps1: Browser (default; the extension starts Portly) or Logon.
 
@@ -62,7 +76,9 @@
     Do not open the browser's extensions page or copy to the clipboard.
 
 .PARAMETER DryRun
-    Print what would happen and change nothing.
+    Print what would happen and change nothing. When winget is present and Node.js is missing
+    (or another major), it still asks winget, read-only, which package carries Node.js 24, so
+    the plan and the message name the id that works today.
 
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1
@@ -72,6 +88,9 @@
 
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -PagesUrl https://me.github.io/
+
+.EXAMPLE
+    powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -RemoteOrigin https://pc.tailnet.ts.net
 #>
 #Requires -Version 5.1
 [CmdletBinding()]
@@ -80,6 +99,7 @@ param(
     [string]$RepoUrl = 'https://github.com/davideAurum/Portly.git',
     [string]$Branch = 'main',
     [string]$PagesUrl,
+    [string]$RemoteOrigin,
     [ValidateSet('Browser', 'Logon')][string]$Trigger = 'Browser',
     [switch]$NoHomebaseCopy,
     [switch]$SkipAutostart,
@@ -88,9 +108,17 @@ param(
     [switch]$DryRun
 )
 
-$SetupMinNodeMajor = 24
+# Node.js 24: the major package.json pins in engines.node, which npm's engine-strict enforces, so
+# this script and lib\Common.ps1's Resolve-HbNode refuse any other major too. check-scripts.ps1
+# keeps $SetupNodeMajor equal to $PortlyNodeMajor in lib\Common.ps1; this script cannot dot-source
+# that file because it also runs on its own, before any checkout exists.
+$SetupNodeMajor = 24
+# winget's packages that install that major, tried in this order: winget gives a major its own
+# id (OpenJS.NodeJS.22, ...) once it is no longer winget's LTS; until then OpenJS.NodeJS.LTS is
+# the one that installs it, and it is used only while its version still is that major.
+$SetupNodePackage = "OpenJS.NodeJS.$SetupNodeMajor"
+$SetupNodeLtsPackage = 'OpenJS.NodeJS.LTS'
 $SetupMinNpm = [version]'11.10.0'
-$SetupNodePackage = 'OpenJS.NodeJS.LTS'
 $SetupGitPackage = 'Git.Git'
 
 function Write-SetupStep { param([string]$Message) Write-Host "==> $Message" -ForegroundColor Cyan }
@@ -128,13 +156,59 @@ function Invoke-SetupProgram {
     }
 }
 
-# Major version of node.exe on PATH, or 0 when there is none.
-function Get-SetupNodeMajor {
+# Version of node.exe on PATH (x.y.z), or $null when there is none.
+function Get-SetupNodeVersion {
     $node = Get-SetupCommand 'node.exe'
-    if ($null -eq $node) { return 0 }
+    if ($null -eq $node) { return $null }
     $text = "$(& $node.Source -p 'process.versions.node' 2>$null)".Trim()
-    if ($text -notmatch '^([0-9]+)\.') { return 0 }
-    return [int]$Matches[1]
+    if ($text -notmatch '^[0-9]+\.[0-9]+\.[0-9]+') { return $null }
+    return $Matches[0]
+}
+
+# The major of a version string (x.y.z), or 0 for $null.
+function Get-SetupMajor {
+    param([string]$Version)
+    if ([string]::IsNullOrWhiteSpace($Version)) { return 0 }
+    return [int]$Version.Split('.')[0]
+}
+
+# The winget install command for a package id, as the arguments winget gets.
+function Get-SetupWingetInstallArguments {
+    param([Parameter(Mandatory)][string]$Id)
+    return @('install', '--id', $Id, '--exact', '--source', 'winget', '--accept-package-agreements', '--accept-source-agreements')
+}
+
+# The version winget would install for a package id (x.y.z), or $null when winget does not list
+# that id. Read-only: 'winget search --exact' prints one table row, "<name> <id> <version>",
+# which is read by the id so the column headings' language does not matter.
+function Get-SetupWingetVersion {
+    param([Parameter(Mandatory)][string]$Winget, [Parameter(Mandatory)][string]$Id)
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $lines = @(& $Winget search --id $Id --exact --source winget --accept-source-agreements 2>$null | ForEach-Object { "$_" })
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($exitCode -ne 0) { return $null }
+    $pattern = '\s' + [regex]::Escape($Id) + '\s+([0-9]+\.[0-9]+\.[0-9]+)'
+    foreach ($line in $lines) {
+        if ($line -match $pattern) { return $Matches[1] }
+    }
+    return $null
+}
+
+# The winget package that installs Node.js $SetupNodeMajor right now (Id and Version), or $null.
+function Find-SetupNodePackage {
+    param([Parameter(Mandatory)][string]$Winget)
+    foreach ($id in @($SetupNodePackage, $SetupNodeLtsPackage)) {
+        $version = Get-SetupWingetVersion -Winget $Winget -Id $id
+        if ($null -ne $version -and (Get-SetupMajor $version) -eq $SetupNodeMajor) {
+            return [pscustomobject]@{ Id = $id; Version = $version }
+        }
+    }
+    return $null
 }
 
 function Get-SetupNpmVersion {
@@ -152,7 +226,7 @@ function Install-SetupWingetPackage {
         throw ("$What is missing and winget is not available to install it. Install 'App Installer' from the " +
             "Microsoft Store (it provides winget), or install $What yourself, then run this again.")
     }
-    $arguments = @('install', '--id', $Id, '--exact', '--source', 'winget', '--accept-package-agreements', '--accept-source-agreements')
+    $arguments = Get-SetupWingetInstallArguments -Id $Id
     Write-SetupInfo "winget $($arguments -join ' ')"
     if ($DryRun) { return }
     # winget exits non-zero for "already installed"; whether the program now works is checked by the caller.
@@ -163,20 +237,60 @@ function Install-SetupWingetPackage {
 }
 
 function Install-SetupNode {
-    $major = Get-SetupNodeMajor
-    if ($major -ge $SetupMinNodeMajor) {
-        Write-SetupOk "Node.js $major found"
-    } else {
-        $found = if ($major -gt 0) { "Node.js $major is too old" } else { 'Node.js is not installed' }
-        Write-SetupStep "$found; installing Node.js LTS (Windows may ask for permission)"
-        Install-SetupWingetPackage -Id $SetupNodePackage -What 'Node.js'
-        if ($DryRun) { return }
-        $major = Get-SetupNodeMajor
-        if ($major -lt $SetupMinNodeMajor) {
-            throw ("Node.js $SetupMinNodeMajor or newer is still not on PATH (found: $major). Install it from " +
-                'https://nodejs.org/, open a new PowerShell window and run this again.')
+    $version = Get-SetupNodeVersion
+    $major = Get-SetupMajor $version
+    if ($major -eq $SetupNodeMajor) {
+        Write-SetupOk "Node.js $version found"
+    } elseif ($major -gt 0) {
+        # Another major, older or newer: npm ci would refuse it (engine-strict), so stop before
+        # anything is installed, with the message lib\Common.ps1's Resolve-HbNode gives too. Only
+        # one of the two winget ids carries the pinned major at a time, so when winget is at hand
+        # the message also names the one that does today (a read-only lookup).
+        $message = ("Portly needs Node.js $SetupNodeMajor, found v$version; install Node.js $SetupNodeMajor from https://nodejs.org/ " +
+            "or with winget install $SetupNodePackage ($SetupNodeLtsPackage while winget's LTS is still $SetupNodeMajor), " +
+            'open a new PowerShell window and run this again.')
+        $winget = Get-SetupCommand 'winget.exe'
+        if ($null -ne $winget) {
+            $package = Find-SetupNodePackage -Winget $winget.Source
+            if ($null -ne $package) {
+                $message += " Today winget lists Node.js $($package.Version) as $($package.Id): winget $((Get-SetupWingetInstallArguments -Id $package.Id) -join ' ')"
+            }
         }
-        Write-SetupOk "Node.js $major installed"
+        throw $message
+    } else {
+        Write-SetupStep "Node.js is not installed; installing Node.js $SetupNodeMajor with winget (Windows may ask for permission)"
+        $winget = Get-SetupCommand 'winget.exe'
+        if ($null -eq $winget) {
+            if ($DryRun) {
+                # The plan, without asking winget which of the two ids carries that major today.
+                Write-SetupInfo "winget $((Get-SetupWingetInstallArguments -Id $SetupNodePackage) -join ' ')"
+                Write-SetupInfo "(or $SetupNodeLtsPackage while winget's LTS is still Node.js $SetupNodeMajor; decided when it runs)"
+                Write-SetupInfo ("winget is not available on this PC: install 'App Installer' from the Microsoft Store first, " +
+                    "or Node.js $SetupNodeMajor from https://nodejs.org/")
+                return
+            }
+            throw ("Node.js is missing and winget is not available to install it. Install 'App Installer' from the " +
+                "Microsoft Store (it provides winget), or install Node.js $SetupNodeMajor from https://nodejs.org/, then run this again.")
+        }
+        $package = Find-SetupNodePackage -Winget $winget.Source
+        if ($null -eq $package) {
+            throw ("winget has no package that installs Node.js $SetupNodeMajor right now (no $SetupNodePackage, and " +
+                "$SetupNodeLtsPackage is not $SetupNodeMajor.x). Install Node.js $SetupNodeMajor from https://nodejs.org/, " +
+                'open a new PowerShell window and run this again.')
+        }
+        Write-SetupInfo "winget lists Node.js $($package.Version) as $($package.Id)"
+        if ($package.Id -ne $SetupNodePackage) {
+            Write-SetupInfo "(winget has no $SetupNodePackage yet: a major gets its own id once a newer LTS replaces it)"
+        }
+        Install-SetupWingetPackage -Id $package.Id -What "Node.js $SetupNodeMajor"
+        if ($DryRun) { return }
+        $version = Get-SetupNodeVersion
+        if ((Get-SetupMajor $version) -ne $SetupNodeMajor) {
+            $found = if ($null -eq $version) { 'none' } else { "v$version" }
+            throw ("Node.js $SetupNodeMajor is still not on PATH (found: $found). Install it from https://nodejs.org/, " +
+                'open a new PowerShell window and run this again.')
+        }
+        Write-SetupOk "Node.js $version installed"
     }
 
     $npmVersion = Get-SetupNpmVersion
@@ -208,6 +322,16 @@ function Install-SetupGit {
 
 function Test-SetupPagesOff { return "$PagesUrl".Trim() -eq 'off' }
 
+# localhost, 127.0.0.1 or [::1], the hosts the server allows plain http for. Windows PowerShell
+# reports an IPv6 host in its long form, so the address is parsed rather than compared as text.
+function Test-SetupLoopbackHost {
+    param([Parameter(Mandatory)][System.Uri]$Uri)
+    if ($Uri.Host -eq 'localhost') { return $true }
+    $ip = $null
+    if (-not [System.Net.IPAddress]::TryParse($Uri.DnsSafeHost, [ref]$ip)) { return $false }
+    return $ip.Equals([System.Net.IPAddress]::Loopback) -or $ip.Equals([System.Net.IPAddress]::IPv6Loopback)
+}
+
 # The -PagesUrl address normalised by the rules server/src/config.ts applies to
 # PORTLY_PAGES_URL (https, or http on localhost/127.0.0.1/[::1]; no user name, password, query
 # or fragment; a "/" is added at the end), so a typo fails before anything is installed. The server
@@ -218,8 +342,7 @@ function ConvertTo-SetupPagesUrl {
     $uri = $null
     $usage = "-PagesUrl must be the Pages site's full address, like https://<user>.github.io/, or 'off' (got '$Value')."
     if ($text -match '[?#\s]' -or -not [System.Uri]::TryCreate($text, [System.UriKind]::Absolute, [ref]$uri)) { throw $usage }
-    $loopback = @('localhost', '127.0.0.1', '[::1]')
-    if (-not ($uri.Scheme -eq 'https' -or ($uri.Scheme -eq 'http' -and $loopback -contains $uri.Host))) {
+    if (-not ($uri.Scheme -eq 'https' -or ($uri.Scheme -eq 'http' -and (Test-SetupLoopbackHost -Uri $uri)))) {
         throw "$usage It must use https (http only for localhost, 127.0.0.1 or [::1])."
     }
     if ($uri.UserInfo) { throw "$usage It must not contain a user name or password." }
@@ -253,6 +376,83 @@ function Set-SetupPagesUrl {
         Set-Item -LiteralPath "Env:$name" -Value $url
     }
     Write-SetupInfo 'New tabs open that site; pair each browser with Portly there once (docs\setup\pages-local-server.md).'
+}
+
+function Test-SetupRemoteOff { return "$RemoteOrigin".Trim() -eq 'off' }
+
+# The -RemoteOrigin address normalised by the rules server/src/config.ts applies to
+# PORTLY_REMOTE_ORIGIN (https, or http on localhost/127.0.0.1/[::1]; the address only: no path,
+# user name, password, query or fragment), so a typo fails before anything is installed. The
+# server checks it again when install-autostart.ps1 starts it (and refuses its own address).
+function ConvertTo-SetupRemoteOrigin {
+    param([Parameter(Mandatory)][string]$Value)
+    $text = $Value.Trim()
+    $uri = $null
+    $usage = "-RemoteOrigin must be the address your other PCs use, like https://<pc>.<tailnet>.ts.net, or 'off' (got '$Value')."
+    if ($text -match '[?#\s]' -or -not [System.Uri]::TryCreate($text, [System.UriKind]::Absolute, [ref]$uri)) { throw $usage }
+    if (-not ($uri.Scheme -eq 'https' -or ($uri.Scheme -eq 'http' -and (Test-SetupLoopbackHost -Uri $uri)))) {
+        throw "$usage It must use https (http only for localhost, 127.0.0.1 or [::1])."
+    }
+    if ($uri.UserInfo) { throw "$usage It must not contain a user name or password." }
+    if ($uri.AbsolutePath -ne '/' -and $uri.AbsolutePath -ne '') { throw "$usage It must be the address only, without a path." }
+    # Portly's own address and the Pages site are refused by the server at start-up; refuse them
+    # here too, before the variable is saved.
+    if ((Test-SetupLoopbackHost -Uri $uri) -and "$($uri.Port)" -eq (Get-SetupOwnPort)) {
+        throw "$usage That is Portly's own address on this PC; other PCs use the reverse proxy's address."
+    }
+    $pages = Get-SetupPagesOrigin
+    if ($null -ne $pages -and $pages -eq $uri.GetLeftPart([System.UriPartial]::Authority)) {
+        throw "$usage That is the Pages site's address, not the address other PCs use to reach Portly on this PC."
+    }
+    return $uri.GetLeftPart([System.UriPartial]::Authority)
+}
+
+# PORTLY_PORT as the server will read it (this process, then the user and machine variables; default 5757).
+function Get-SetupOwnPort {
+    foreach ($scope in @('Process', 'User', 'Machine')) {
+        $value = [System.Environment]::GetEnvironmentVariable('PORTLY_PORT', $scope)
+        if (-not [string]::IsNullOrWhiteSpace($value)) { return $value.Trim() }
+    }
+    return '5757'
+}
+
+# The Pages site's origin: -PagesUrl when given (not 'off'), else the user variable; $null without one.
+function Get-SetupPagesOrigin {
+    $value = if (-not [string]::IsNullOrWhiteSpace($PagesUrl) -and -not (Test-SetupPagesOff)) { $PagesUrl } else { [System.Environment]::GetEnvironmentVariable('PORTLY_PAGES_URL', 'User') }
+    if ([string]::IsNullOrWhiteSpace($value) -or "$value".Trim() -eq 'off') { return $null }
+    $uri = $null
+    if (-not [System.Uri]::TryCreate($value.Trim(), [System.UriKind]::Absolute, [ref]$uri)) { return $null }
+    return $uri.GetLeftPart([System.UriPartial]::Authority)
+}
+
+# -RemoteOrigin: saves the address as the user environment variable PORTLY_REMOTE_ORIGIN ('off'
+# removes it), and in this process too, so install-autostart.ps1 checks and starts the server with it.
+function Set-SetupRemoteOrigin {
+    if ([string]::IsNullOrWhiteSpace($RemoteOrigin)) { return }
+    $prefix = if ($DryRun) { '[dry run] ' } else { '' }
+    $name = 'PORTLY_REMOTE_ORIGIN'
+    if (Test-SetupRemoteOff) {
+        # The port only means something with the origin (the server refuses it alone): both go.
+        Write-SetupStep "${prefix}Other PCs off: removing the user environment variables $name and PORTLY_REMOTE_PORT"
+        foreach ($each in @($name, 'PORTLY_REMOTE_PORT')) {
+            if (-not $DryRun) {
+                [System.Environment]::SetEnvironmentVariable($each, $null, 'User')
+                Remove-Item -LiteralPath "Env:$each" -ErrorAction SilentlyContinue
+            }
+            if (-not [string]::IsNullOrWhiteSpace([System.Environment]::GetEnvironmentVariable($each, 'Machine'))) {
+                Write-Warning "$each is also set for the whole PC (machine environment variable); remove it there too (needs an administrator)."
+            }
+        }
+        Write-SetupInfo 'Portly listens on this PC only again; PCs connected before are refused (remove them in Settings -> Devices).'
+        return
+    }
+    $origin = ConvertTo-SetupRemoteOrigin -Value $RemoteOrigin
+    Write-SetupStep "${prefix}Other PCs: setting the user environment variable $name = $origin"
+    if (-not $DryRun) {
+        [System.Environment]::SetEnvironmentVariable($name, $origin, 'User')
+        Set-Item -LiteralPath "Env:$name" -Value $origin
+    }
+    Write-SetupInfo 'The reverse proxy must forward to the port after Portly''s own (5758 by default: tailscale serve --bg 5758); approve each PC in Settings -> Devices (docs\setup\other-pcs.md).'
 }
 
 function Test-SetupCheckout {
@@ -292,12 +492,17 @@ function Get-SetupCheckoutCommit {
 # Clones (or reuses) -InstallDir and runs its scripts\setup.ps1 with the same options.
 function Invoke-SetupFromClone {
     $target = [System.IO.Path]::GetFullPath($InstallDir)
-    # A mistyped -PagesUrl fails now, before anything is downloaded.
+    # A mistyped -PagesUrl or -RemoteOrigin fails now, before anything is downloaded.
     if (-not [string]::IsNullOrWhiteSpace($PagesUrl) -and -not (Test-SetupPagesOff)) { $null = ConvertTo-SetupPagesUrl -Value $PagesUrl }
+    if (-not [string]::IsNullOrWhiteSpace($RemoteOrigin) -and -not (Test-SetupRemoteOff)) { $null = ConvertTo-SetupRemoteOrigin -Value $RemoteOrigin }
     Install-SetupGit
     if (Test-SetupCheckout -Path $target) {
-        if (-not (Test-Path -LiteralPath (Join-Path $target 'scripts\setup.ps1') -PathType Leaf)) {
+        $targetSetup = Join-Path $target 'scripts\setup.ps1'
+        if (-not (Test-Path -LiteralPath $targetSetup -PathType Leaf)) {
             throw "The checkout in $target is older than this script. Update it (git -C ""$target"" pull) and run this again."
+        }
+        if (-not [string]::IsNullOrWhiteSpace($RemoteOrigin) -and -not (Select-String -LiteralPath $targetSetup -Pattern '\$RemoteOrigin' -Quiet)) {
+            throw "The checkout in $target is older than this script and does not know -RemoteOrigin. Update it (git -C ""$target"" pull) and run this again."
         }
         Write-SetupOk "Found an existing checkout in $target. Setup uses its code as it is and does not update it."
         $commit = Get-SetupCheckoutCommit -Path $target
@@ -320,6 +525,7 @@ function Invoke-SetupFromClone {
 
     $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $target 'scripts\setup.ps1'), '-Trigger', $Trigger)
     if (-not [string]::IsNullOrWhiteSpace($PagesUrl)) { $arguments += @('-PagesUrl', $PagesUrl.Trim()) }
+    if (-not [string]::IsNullOrWhiteSpace($RemoteOrigin)) { $arguments += @('-RemoteOrigin', $RemoteOrigin.Trim()) }
     foreach ($name in @('NoHomebaseCopy', 'SkipAutostart', 'SkipCli', 'NoBrowser', 'DryRun')) {
         if ((Get-Variable -Name $name -ValueOnly).IsPresent) { $arguments += "-$name" }
     }
@@ -370,7 +576,11 @@ function Invoke-SetupHere {
     }
     $prefix = if ($DryRun) { '[dry run] ' } else { '' }
     Write-SetupStep "${prefix}Setting up Portly in $RepoRoot"
+    # Both checked before either is saved: a mistyped second option must not leave the first behind.
+    if (-not [string]::IsNullOrWhiteSpace($PagesUrl) -and -not (Test-SetupPagesOff)) { $null = ConvertTo-SetupPagesUrl -Value $PagesUrl }
+    if (-not [string]::IsNullOrWhiteSpace($RemoteOrigin) -and -not (Test-SetupRemoteOff)) { $null = ConvertTo-SetupRemoteOrigin -Value $RemoteOrigin }
     Set-SetupPagesUrl
+    Set-SetupRemoteOrigin
     Install-SetupNode
     $npm = if ($DryRun) { $null } else { (Get-SetupCommand 'npm.cmd').Source }
 
