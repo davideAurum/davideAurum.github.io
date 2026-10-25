@@ -1,1 +1,0 @@
-import{F as e}from"./keys-CnubvmMn.js";import{K as t}from"./index-C4w5PXAN.js";import{a as n,i as r}from"./format-DurUsghE.js";var i=e();function a({date:e,className:a}){let o=t(3e4),s=n(),c=r(e);return Number.isNaN(c.getTime())?null:(0,i.jsx)(`time`,{className:a,dateTime:c.toISOString(),title:s.dateTime(c),children:s.relative(c,o)})}export{a as t};

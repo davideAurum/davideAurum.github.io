@@ -1,0 +1,1 @@
+function e(e,t){return`${t===``?`http://127.0.0.1:5757`:t.replace(/\/+$/,``)}/#/${e}`}var t=/^(?:[a-z0-9-]+\.)+localhost$/;function n(e){return e===`localhost`||e===`127.0.0.1`||e===`[::1]`||t.test(e)}export{e as n,n as t};
