@@ -10,12 +10,15 @@
     2. Downloads the package into a temporary folder and checks its SHA-256.
     3. Unpacks it into <InstallDir>\app.new and checks it is a Portly release for Windows x64.
     4. New install: moves it to <InstallDir>\app.
-       Update: stops the Portly processes running from <InstallDir>\app (also those running as
-       portly-supervisor.exe / portly-server.exe from %LOCALAPPDATA%\Portly\node), copies the database to
+       Update: disables the Portly Server task while the folders are swapped (so a Portly tab cannot
+       start the old copy again), stops the Portly processes running from <InstallDir>\app (also those
+       running as portly-supervisor.exe / portly-server.exe from %LOCALAPPDATA%\Portly\node), copies the database to
        <data folder>\backups\portly-before-<version>-<time>.db, keeps the old version as
        <InstallDir>\app.previous and moves the new one to <InstallDir>\app. If the new version
        does not start, the old one and the database copy are put back and the old one is started
        again (the database the new version left is kept as backups\portly-failed-<version>-<time>.db).
+       Each folder is renamed in one step: if a file in it is in use, nothing moves and the old
+       version is started again.
     5. Links node_modules\@portly\shared to the package's shared folder (a junction).
     6. With -PagesUrl: saves the Pages site's address as PORTLY_PAGES_URL (as setup.ps1 does).
     7. Runs app\scripts\install-autostart.ps1 with app\runtime\node.exe (the scheduled task, run as
@@ -102,6 +105,7 @@ $InstManifestName = 'portly-release.json'
 $InstPlatform = 'win-x64'
 $InstTaskName = 'Portly Server'
 $InstKeepBackups = 3
+$InstMoveAttempts = 20
 
 function Write-InstStep { param([string]$Message) Write-Host "==> $Message" -ForegroundColor Cyan }
 function Write-InstOk { param([string]$Message) Write-Host "OK  $Message" -ForegroundColor Green }
@@ -251,21 +255,42 @@ function Remove-InstAppFolder {
     Remove-Item -LiteralPath $Path -Recurse -Force
 }
 
-# Renames a folder, retrying while something (an antivirus scan, an Explorer window) still holds
-# a file in it.
+# Renames a folder in one step, retrying for up to 10 s while something (an antivirus scan, an
+# Explorer window) still holds a file in it. Directory.Move is all or nothing; Windows PowerShell
+# 5.1's Move-Item instead falls back to moving the files one by one and stops at the first one in
+# use, leaving the folder split in two.
 function Move-InstFolder {
     param([Parameter(Mandatory)][string]$From, [Parameter(Mandatory)][string]$To)
     for ($attempt = 1; ; $attempt++) {
         try {
-            Move-Item -LiteralPath $From -Destination $To -ErrorAction Stop
+            [System.IO.Directory]::Move($From, $To)
             return
         } catch {
-            if ($attempt -ge 10) {
-                throw ("Could not move $From to $To ($($_.Exception.Message)). Close any window, terminal or program " +
+            if ($attempt -ge $InstMoveAttempts) {
+                $reason = if ($null -ne $_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+                throw ("Could not move $From to $To ($reason). Close any window, terminal or program " +
                     'using a file in that folder and run this again.')
             }
             Start-Sleep -Milliseconds 500
         }
+    }
+}
+
+# Enables or disables the Portly Server task; returns whether that worked. While it is disabled, a
+# Portly tab that finds the server gone cannot have the launcher start it again.
+function Set-InstTaskEnabled {
+    param([bool]$Enabled)
+    try {
+        if ($Enabled) {
+            $null = Enable-ScheduledTask -TaskName $InstTaskName -TaskPath '\' -ErrorAction Stop
+        } else {
+            $null = Disable-ScheduledTask -TaskName $InstTaskName -TaskPath '\' -ErrorAction Stop
+        }
+        return $true
+    } catch {
+        $verb = if ($Enabled) { 'enable' } else { 'disable' }
+        Write-Warning "Could not $verb the '$InstTaskName' task: $($_.Exception.Message)"
+        return $false
     }
 }
 
@@ -475,23 +500,29 @@ function Restore-InstPrevious {
     $previous = Join-Path $Root 'app.previous'
     $failed = Join-Path $Root 'app.failed'
     Write-InstStep 'Putting the previous version back'
-    $null = Stop-InstAppProcesses -AppDir $app
-    if (-not [string]::IsNullOrEmpty($Backup)) {
-        try {
-            $kept = Restore-InstDatabase -Backup $Backup -Label $Label
-            Write-InstOk "The database copied before the update is back (from $Backup)."
-            if ($null -ne $kept) { Write-InstInfo "The database Portly $Label left is kept in $kept" }
-        } catch {
-            Write-Warning "Could not put the database copied before the update back: $($_.Exception.Message). It is in $Backup."
+    $taskDisabled = $Task.Ours -and (Set-InstTaskEnabled -Enabled $false)
+    if ($Task.Ours) { try { Stop-ScheduledTask -TaskName $InstTaskName -TaskPath '\' -ErrorAction Stop } catch { } }
+    try {
+        $null = Stop-InstAppProcesses -AppDir $app
+        if (-not [string]::IsNullOrEmpty($Backup)) {
+            try {
+                $kept = Restore-InstDatabase -Backup $Backup -Label $Label
+                Write-InstOk "The database copied before the update is back (from $Backup)."
+                if ($null -ne $kept) { Write-InstInfo "The database Portly $Label left is kept in $kept" }
+            } catch {
+                Write-Warning "Could not put the database copied before the update back: $($_.Exception.Message). It is in $Backup."
+            }
         }
+        Remove-InstAppFolder -Path $failed
+        if (Test-Path -LiteralPath $app) {
+            Remove-InstLinks -AppDir $app
+            Move-InstFolder -From $app -To $failed
+        }
+        Move-InstFolder -From $previous -To $app
+        Initialize-InstLinks -AppDir $app
+    } finally {
+        if ($taskDisabled) { $null = Set-InstTaskEnabled -Enabled $true }
     }
-    Remove-InstAppFolder -Path $failed
-    if (Test-Path -LiteralPath $app) {
-        Remove-InstLinks -AppDir $app
-        Move-InstFolder -From $app -To $failed
-    }
-    Move-InstFolder -From $previous -To $app
-    Initialize-InstLinks -AppDir $app
     if ($Task.Ours -and -not $SkipAutostart) {
         if ((Invoke-InstAutostart -AppDir $app -Mode $Mode) -ne 0) {
             Write-InstFailure 'The previous version did not start either; see the output above (portly --status --logs).'
@@ -591,27 +622,33 @@ function Invoke-InstMain {
         $task = Get-InstTask -AppDir $app
         $mode = if ($InstTriggerGiven) { $Trigger } else { $task.Mode }
         Write-InstStep "Updating Portly $installedVersion to $newVersion"
+        # The task stays disabled while the folders are swapped: a Portly tab that finds the server
+        # gone asks the launcher to run the task, which would start the old copy again and hold its files.
+        $taskDisabled = $task.Ours -and (Set-InstTaskEnabled -Enabled $false)
         if ($task.Ours) { try { Stop-ScheduledTask -TaskName $InstTaskName -TaskPath '\' -ErrorAction Stop } catch { } }
-        $stopped = Stop-InstAppProcesses -AppDir $app
-        if ($stopped -gt 0) { Write-InstInfo "Stopped $stopped Portly process(es)." }
-        $backup = Backup-InstDatabase -Label $installedVersion
-        if ($null -ne $backup) { Write-InstInfo "Database copied to $backup" }
-        Remove-InstAppFolder -Path $previous
-        Remove-InstLinks -AppDir $app
+        $swapped = $false
         try {
+            $stopped = Stop-InstAppProcesses -AppDir $app
+            if ($stopped -gt 0) { Write-InstInfo "Stopped $stopped Portly process(es)." }
+            $backup = Backup-InstDatabase -Label $installedVersion
+            if ($null -ne $backup) { Write-InstInfo "Database copied to $backup" }
+            Remove-InstAppFolder -Path $previous
+            Remove-InstLinks -AppDir $app
             Move-InstFolder -From $app -To $previous
-        } catch {
-            Initialize-InstLinks -AppDir $app
-            if ($task.Ours) { try { Start-ScheduledTask -TaskName $InstTaskName -TaskPath '\' } catch { } }
-            throw
-        }
-        try {
-            Move-InstFolder -From $staged -To $app
-        } catch {
-            Move-InstFolder -From $previous -To $app
-            Initialize-InstLinks -AppDir $app
-            if ($task.Ours) { try { Start-ScheduledTask -TaskName $InstTaskName -TaskPath '\' } catch { } }
-            throw
+            try {
+                Move-InstFolder -From $staged -To $app
+            } catch {
+                Move-InstFolder -From $previous -To $app
+                throw
+            }
+            $swapped = $true
+        } finally {
+            if ($taskDisabled) { $null = Set-InstTaskEnabled -Enabled $true }
+            if (-not $swapped) {
+                # Nothing was replaced: the old version is linked and started again.
+                if (Test-Path -LiteralPath $app) { Initialize-InstLinks -AppDir $app }
+                if ($task.Ours) { try { Start-ScheduledTask -TaskName $InstTaskName -TaskPath '\' } catch { } }
+            }
         }
         Initialize-InstLinks -AppDir $app
         Set-InstPagesUrl
@@ -632,13 +669,14 @@ function Invoke-InstMain {
             Write-InstStep 'The portly command: scripts\install-cli.ps1'
             if ((Invoke-InstScript -AppDir $app -Script 'install-cli.ps1') -ne 0) { Write-Warning 'install-cli.ps1 failed (see above).' }
         }
+        Write-InstOk "Updated Portly $installedVersion -> $newVersion. The previous version is kept in $previous."
+        # Last, so it is still on screen when the output ends (the scripts above print a lot).
         $oldExtension = "$(Get-InstProperty $installed 'extensionVersion')"
         $newExtension = "$(Get-InstProperty $new 'extensionVersion')"
         if ($oldExtension -ne $newExtension) {
-            Write-InstStep "The new-tab extension changed ($oldExtension -> $newExtension)"
-            Write-InstInfo 'Click Reload on Portly New Tab in chrome://extensions (or edge://extensions).'
+            Write-Warning ("The new-tab extension changed ($oldExtension -> $newExtension): click Reload on " +
+                'Portly New Tab in chrome://extensions (or edge://extensions).')
         }
-        Write-InstOk "Updated Portly $installedVersion -> $newVersion. The previous version is kept in $previous."
         return 0
     } finally {
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
