@@ -1,0 +1,1 @@
+import{t as e}from"./jsx-runtime-4at9Mnti.js";import{Z as t}from"./index-DIP_cPux.js";import{a as n,i as r}from"./format-Vt2XtDtd.js";var i=e();function a({date:e,className:a}){let o=t(3e4),s=n(),c=r(e);return Number.isNaN(c.getTime())?null:(0,i.jsx)(`time`,{className:a,dateTime:c.toISOString(),title:s.dateTime(c),children:s.relative(c,o)})}export{a as t};
