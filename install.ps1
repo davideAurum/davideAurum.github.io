@@ -28,6 +28,11 @@
     8. New install: shows how to load the new-tab extension from <InstallDir>\app\extension.
        Update: says when the extension changed and needs a Reload.
 
+    With -OnlyNewer -StatusFile (portly --update --unattended, run by the Portly Updater task), only
+    a newer version is installed and each stage goes into the status file, in closed values only,
+    because that file reaches other PCs (docs\design\update-button.md section 13). One install runs
+    at a time.
+
     Your data (%LOCALAPPDATA%\Portly, or PORTLY_DATA_DIR) is never moved or deleted.
     Self-contained, so it also runs as `irm <url> | iex` before anything is installed; installed
     copies run it for `portly --update`. See docs\setup\releases.md.
@@ -70,6 +75,14 @@
 .PARAMETER NoBrowser
     Do not open the browser's extensions page or copy to the clipboard.
 
+.PARAMETER OnlyNewer
+    Install only a version newer than the installed one: anything else stops before changing
+    anything, -Force included.
+
+.PARAMETER StatusFile
+    Report how the update goes in this file (the server's update-status.json). A `requested` run
+    the server left there is carried on; otherwise a new run starts. Downloads get a time limit.
+
 .PARAMETER DryRun
     Say which release would be installed and where, and change nothing (nothing is downloaded
     but the small portly-release.json).
@@ -97,6 +110,8 @@ param(
     [switch]$SkipAutostart,
     [switch]$SkipCli,
     [switch]$NoBrowser,
+    [switch]$OnlyNewer,
+    [string]$StatusFile,
     [switch]$DryRun
 )
 
@@ -106,6 +121,11 @@ $InstPlatform = 'win-x64'
 $InstTaskName = 'Portly Server'
 $InstKeepBackups = 3
 $InstMoveAttempts = 20
+# With nobody watching, a download may not hang. The Portly Updater task's own limit is 15 minutes.
+$InstUnattendedTimeoutSeconds = 600
+# The run being reported in -StatusFile, and the code a failure from here on would report.
+$script:InstRun = $null
+$script:InstFailCode = 'unknown'
 
 function Write-InstStep { param([string]$Message) Write-Host "==> $Message" -ForegroundColor Cyan }
 function Write-InstOk { param([string]$Message) Write-Host "OK  $Message" -ForegroundColor Green }
@@ -161,8 +181,9 @@ function Invoke-InstDownload {
     } catch { }
     $previousProgress = $ProgressPreference
     $ProgressPreference = 'SilentlyContinue'
+    $timeout = if ([string]::IsNullOrWhiteSpace($StatusFile)) { 0 } else { $InstUnattendedTimeoutSeconds }
     try {
-        Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
+        Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -TimeoutSec $timeout -ErrorAction Stop
     } catch {
         $status = $null
         try { $status = [int]$_.Exception.Response.StatusCode } catch { }
@@ -492,7 +513,7 @@ function Test-InstPackage {
 }
 
 # Puts the previous version and the database copied before the update back after a failed
-# update, and starts it again when the task runs it.
+# update, and starts it again when the task runs it. Returns whether it came back.
 function Restore-InstPrevious {
     param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)]$Task, [Parameter(Mandatory)][string]$Mode,
         [string]$Backup, [Parameter(Mandatory)][string]$Label)
@@ -526,10 +547,220 @@ function Restore-InstPrevious {
     if ($Task.Ours -and -not $SkipAutostart) {
         if ((Invoke-InstAutostart -AppDir $app -Mode $Mode) -ne 0) {
             Write-InstFailure 'The previous version did not start either; see the output above (portly --status --logs).'
-            return
+            return $false
         }
     }
     Write-InstOk "The previous version is back in $app (the new one is in $failed)."
+    return $true
+}
+
+# One part of a version: a whole number without leading zeros that a JavaScript number holds
+# exactly, as shared/src/version.ts reads it, else $null.
+function ConvertTo-InstVersionNumber {
+    param([Parameter(Mandatory)][string]$Text)
+    if ($Text.Length -gt 1 -and $Text.StartsWith('0', [System.StringComparison]::Ordinal)) { return $null }
+    $value = [long]0
+    if (-not [long]::TryParse($Text, [ref]$value) -or $value -gt 9007199254740991) { return $null }
+    return $value
+}
+
+# A version's parts, or $null for anything shared/src/version.ts would not read.
+function ConvertTo-InstVersion {
+    param([AllowEmptyString()][string]$Text)
+    if ($Text.Length -gt 40) { return $null }
+    $match = [regex]::Match($Text, '^([0-9]+)\.([0-9]+)\.([0-9]+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?\z')
+    if (-not $match.Success) { return $null }
+    $core = New-Object System.Collections.Generic.List[long]
+    foreach ($group in 1..3) {
+        $number = ConvertTo-InstVersionNumber -Text $match.Groups[$group].Value
+        if ($null -eq $number) { return $null }
+        $core.Add($number)
+    }
+    $prerelease = New-Object System.Collections.Generic.List[object]
+    if ($match.Groups[4].Success) {
+        foreach ($part in $match.Groups[4].Value.Split('.')) {
+            $identifier = $part
+            if ($part -match '^[0-9]+$') {
+                $identifier = ConvertTo-InstVersionNumber -Text $part
+                if ($null -eq $identifier) { return $null }
+            }
+            $prerelease.Add($identifier)
+        }
+    }
+    return [pscustomobject]@{ Core = $core.ToArray(); Prerelease = $prerelease.ToArray() }
+}
+
+# Portly's version order, a port of compareVersions in shared/src/version.ts (this script is
+# self-contained), with the table shared/src/__fixtures__/version-order.json for both: negative
+# when $One is older than $Other, positive when newer, 0 when they rank the same, $null when either
+# can't be read. Words compare ordinally: -lt on strings follows the culture and ignores case.
+function Compare-InstVersion {
+    param([AllowEmptyString()][string]$One, [AllowEmptyString()][string]$Other)
+    $first = ConvertTo-InstVersion -Text $One
+    $second = ConvertTo-InstVersion -Text $Other
+    if ($null -eq $first -or $null -eq $second) { return $null }
+    for ($i = 0; $i -lt 3; $i++) {
+        if ($first.Core[$i] -lt $second.Core[$i]) { return -1 }
+        if ($first.Core[$i] -gt $second.Core[$i]) { return 1 }
+    }
+    $firstPre = $first.Prerelease
+    $secondPre = $second.Prerelease
+    # A release is newer than its own prereleases.
+    if ($firstPre.Length -eq 0 -or $secondPre.Length -eq 0) { return $secondPre.Length - $firstPre.Length }
+    for ($i = 0; $i -lt $firstPre.Length; $i++) {
+        if ($i -ge $secondPre.Length) { return 1 }
+        $left = $firstPre[$i]
+        $right = $secondPre[$i]
+        $leftNumber = $left -is [long]
+        $rightNumber = $right -is [long]
+        if ($leftNumber -and $rightNumber) {
+            if ($left -lt $right) { return -1 }
+            if ($left -gt $right) { return 1 }
+            continue
+        }
+        # Numbers sort before words.
+        if ($leftNumber) { return -1 }
+        if ($rightNumber) { return 1 }
+        $order = [string]::CompareOrdinal($left, $right)
+        if ($order -ne 0) { return $order }
+    }
+    return $firstPre.Length - $secondPre.Length
+}
+
+# True only when $Candidate is certainly newer: a version that can't be read never is.
+function Test-InstNewer {
+    param([AllowEmptyString()][string]$Candidate, [AllowEmptyString()][string]$Than)
+    $order = Compare-InstVersion -One $Candidate -Other $Than
+    return $null -ne $order -and $order -gt 0
+}
+
+# With -OnlyNewer, stops unless $Candidate is newer than what is installed.
+function Assert-InstNewer {
+    param([string]$Candidate, [string]$Installed)
+    if (-not $OnlyNewer -or -not $Candidate -or -not $Installed) { return }
+    if (Test-InstNewer -Candidate $Candidate -Than $Installed) { return }
+    Set-InstRun -FailCode 'not_newer'
+    throw "Portly $Candidate is not newer than the installed $Installed, so nothing was changed."
+}
+
+function Get-InstUtcStamp {
+    return [System.DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+# The `requested` run the server left in -StatusFile, or $null. PowerShell 7 reads the date as a
+# date, Windows PowerShell as text.
+function Read-InstRequestedRun {
+    if ([string]::IsNullOrWhiteSpace($StatusFile)) { return $null }
+    $file = $null
+    try { $file = Read-InstJson -Path $StatusFile } catch { return $null }
+    if ($null -eq $file -or (Get-InstProperty $file 'state') -ne 'requested') { return $null }
+    $started = Get-InstProperty $file 'startedAt'
+    if ($started -is [datetime]) {
+        $started = $started.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    $id = "$(Get-InstProperty $file 'id')"
+    $from = "$(Get-InstProperty $file 'from')"
+    if ($id -notmatch '^[0-9A-Za-z-]{1,64}$' -or -not (Test-InstVersion $from) -or
+        "$started" -notmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$') {
+        return $null
+    }
+    return [pscustomobject]@{ Id = $id; From = $from; StartedAt = "$started" }
+}
+
+# Starts reporting: the server's `requested` run, or a new one when an install was named.
+function Initialize-InstRun {
+    param([string]$InstalledVersion)
+    if ([string]::IsNullOrWhiteSpace($StatusFile) -or $DryRun) { return }
+    $requested = Read-InstRequestedRun
+    if ($null -eq $requested -and -not $InstalledVersion) { return }
+    $script:InstRun = [ordered]@{
+        id               = if ($null -ne $requested) { $requested.Id } else { [guid]::NewGuid().ToString() }
+        state            = 'requested'
+        from             = if ($null -ne $requested) { $requested.From } else { $InstalledVersion }
+        to               = $null
+        startedAt        = if ($null -ne $requested) { $requested.StartedAt } else { Get-InstUtcStamp }
+        finishedAt       = $null
+        code             = $null
+        extensionChanged = $false
+    }
+}
+
+# Replaces -StatusFile in one step. A report that cannot be written never stops an update.
+function Write-InstRun {
+    if ($null -eq $script:InstRun) { return }
+    $temp = "$StatusFile.$([guid]::NewGuid().ToString('N')).new"
+    try {
+        [System.IO.File]::WriteAllText($temp, ($script:InstRun | ConvertTo-Json -Compress), (New-Object System.Text.UTF8Encoding($false)))
+        for ($attempt = 1; ; $attempt++) {
+            try {
+                if (Test-Path -LiteralPath $StatusFile -PathType Leaf) {
+                    # No backup. A plain $null reaches the method as an empty path.
+                    [System.IO.File]::Replace($temp, $StatusFile, [System.Management.Automation.Language.NullString]::Value)
+                } else {
+                    [System.IO.File]::Move($temp, $StatusFile)
+                }
+                return
+            } catch {
+                if ($attempt -ge 10) { throw }
+                Start-Sleep -Milliseconds 100
+            }
+        }
+    } catch {
+        Write-Warning "Could not write the update status: $($_.Exception.Message)"
+        Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Moves the reported run on, and names what a failure from here on would report.
+function Set-InstRun {
+    param([string]$State, [string]$FailCode, [string]$To)
+    if ($FailCode) { $script:InstFailCode = $FailCode }
+    if ($null -eq $script:InstRun -or (-not $State -and -not $To)) { return }
+    if ($State) { $script:InstRun.state = $State }
+    if ($To) { $script:InstRun.to = $To }
+    Write-InstRun
+}
+
+function Complete-InstRun {
+    param([Parameter(Mandatory)][string]$State, [string]$Code, [bool]$ExtensionChanged = $false)
+    if ($null -eq $script:InstRun) { return }
+    $script:InstRun.state = $State
+    $script:InstRun.code = if ($Code) { $Code } else { $null }
+    $script:InstRun.extensionChanged = $ExtensionChanged
+    $script:InstRun.finishedAt = Get-InstUtcStamp
+    Write-InstRun
+    $script:InstRun = $null
+}
+
+# One install at a time, for this user in any session (a terminal, the task, an SSH login): the
+# mutex object, or $null while another install holds it. Another install at a higher or lower
+# integrity level shows as access denied.
+function Enter-InstLock {
+    $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $lock = $null
+    try {
+        $lock = New-Object System.Threading.Mutex($false, "Global\PortlyInstall-$user")
+    } catch {
+        if ($_.Exception.GetBaseException() -is [System.UnauthorizedAccessException]) { return $null }
+        throw
+    }
+    try {
+        if ($lock.WaitOne(0)) { return $lock }
+    } catch {
+        # The last install died holding it: it is ours now.
+        if ($_.Exception.GetBaseException() -is [System.Threading.AbandonedMutexException]) { return $lock }
+        $lock.Dispose()
+        throw
+    }
+    $lock.Dispose()
+    return $null
+}
+
+function Exit-InstLock {
+    param($Lock)
+    if ($null -eq $Lock) { return }
+    try { $Lock.ReleaseMutex() } catch { }
+    $Lock.Dispose()
 }
 
 function Invoke-InstMain {
@@ -548,11 +779,15 @@ function Invoke-InstMain {
         throw "$app exists but is not a Portly release install. Pass -InstallDir with another folder."
     }
     $installedVersion = if ($null -ne $installed) { "$($installed.version)" } else { $null }
+    Initialize-InstRun -InstalledVersion $installedVersion
 
     $work = Join-Path ([System.IO.Path]::GetTempPath()) ('portly-install-' + [guid]::NewGuid().ToString('N'))
     $null = New-Item -ItemType Directory -Path $work -Force
     try {
+        Set-InstRun -State 'downloading' -FailCode 'download_failed'
         $release = Resolve-InstRelease -Work $work
+        Set-InstRun -To $release.Version
+        Assert-InstNewer -Candidate $release.Version -Installed $installedVersion
         $label = if ($release.Version) { $release.Version } else { 'the package' }
         if ($null -ne $installedVersion -and $release.Version -eq $installedVersion -and -not $Force) {
             Write-InstOk "Portly $installedVersion is already installed in $app (-Force reinstalls it)."
@@ -573,6 +808,7 @@ function Invoke-InstMain {
             $zip = Join-Path $work ([System.IO.Path]::GetFileName($release.Package))
             Invoke-InstDownload -Url $release.Package -OutFile $zip -What "The package of release $label"
         }
+        Set-InstRun -State 'installing' -FailCode 'checksum_mismatch'
         if ($release.Sha256) {
             $actual = Get-InstSha256 -Path $zip
             if ($actual -ne $release.Sha256) {
@@ -583,6 +819,7 @@ function Invoke-InstMain {
             Write-Warning 'No SHA-256 to check the package against (no -Sha256 and no portly-release.json next to it).'
         }
 
+        Set-InstRun -FailCode 'unknown'
         Write-InstStep "Unpacking into $staged"
         if (-not (Test-Path -LiteralPath $root)) { $null = New-Item -ItemType Directory -Path $root -Force }
         Remove-InstAppFolder -Path $staged
@@ -590,6 +827,13 @@ function Invoke-InstMain {
         [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $staged)
         $new = Test-InstPackage -Dir $staged -ExpectedVersion $release.Version
         $newVersion = "$($new.version)"
+        Set-InstRun -To $newVersion
+        try {
+            Assert-InstNewer -Candidate $newVersion -Installed $installedVersion
+        } catch {
+            Remove-InstAppFolder -Path $staged
+            throw
+        }
         if ($null -ne $installedVersion -and $newVersion -eq $installedVersion -and -not $Force) {
             Remove-InstAppFolder -Path $staged
             Write-InstOk "Portly $installedVersion is already installed in $app (-Force reinstalls it)."
@@ -619,6 +863,7 @@ function Invoke-InstMain {
         }
 
         # Update.
+        Set-InstRun -FailCode 'file_in_use'
         $task = Get-InstTask -AppDir $app
         $mode = if ($InstTriggerGiven) { $Trigger } else { $task.Mode }
         Write-InstStep "Updating Portly $installedVersion to $newVersion"
@@ -650,6 +895,7 @@ function Invoke-InstMain {
                 if ($task.Ours) { try { Start-ScheduledTask -TaskName $InstTaskName -TaskPath '\' } catch { } }
             }
         }
+        Set-InstRun -State 'restarting' -FailCode 'did_not_start'
         Initialize-InstLinks -AppDir $app
         Set-InstPagesUrl
 
@@ -657,7 +903,8 @@ function Invoke-InstMain {
             if ($task.Ours -or -not $task.Exists) {
                 if ((Invoke-InstAutostart -AppDir $app -Mode $mode) -ne 0) {
                     Write-InstFailure "Portly $newVersion did not start (see above)."
-                    Restore-InstPrevious -Root $root -Task $task -Mode $mode -Backup $backup -Label $newVersion
+                    $restored = Restore-InstPrevious -Root $root -Task $task -Mode $mode -Backup $backup -Label $newVersion | Select-Object -Last 1
+                    Complete-InstRun -State $(if ($restored) { 'rolled-back' } else { 'failed' }) -Code 'did_not_start'
                     return 1
                 }
             } else {
@@ -673,6 +920,7 @@ function Invoke-InstMain {
         # Last, so it is still on screen when the output ends (the scripts above print a lot).
         $oldExtension = "$(Get-InstProperty $installed 'extensionVersion')"
         $newExtension = "$(Get-InstProperty $new 'extensionVersion')"
+        Complete-InstRun -State 'done' -ExtensionChanged ($oldExtension -ne $newExtension)
         if ($oldExtension -ne $newExtension) {
             Write-Warning ("The new-tab extension changed ($oldExtension -> $newExtension): click Reload on " +
                 'Portly New Tab in chrome://extensions (or edge://extensions).')
@@ -685,13 +933,24 @@ function Invoke-InstMain {
 
 $savedOutputEncoding = [Console]::OutputEncoding
 $installExitCode = 1
+$installLock = $null
 try {
     [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    if (-not $DryRun) {
+        $installLock = Enter-InstLock
+        if ($null -eq $installLock) {
+            Initialize-InstRun
+            throw 'Another Portly install or update is running. Wait for it to finish and run this again.'
+        }
+    }
     $installExitCode = Invoke-InstMain | Select-Object -Last 1
 } catch {
     Write-InstFailure $_.Exception.Message
     $installExitCode = 1
 } finally {
+    # Whatever the run did not report itself.
+    if ($installExitCode -eq 0) { Complete-InstRun -State 'done' } else { Complete-InstRun -State 'failed' -Code $script:InstFailCode }
+    Exit-InstLock -Lock $installLock
     try { [Console]::OutputEncoding = $savedOutputEncoding } catch { }
 }
 # Run as a file: exit with the result. Run with irm | iex: leave the caller's window open.
