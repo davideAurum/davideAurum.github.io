@@ -5,9 +5,9 @@
 
 .DESCRIPTION
     1. Installs what is missing with winget: Git (only when the code must be cloned) and Node.js
-       24, the major package.json pins (winget's OpenJS.NodeJS.24, or OpenJS.NodeJS.LTS while that
-       still is 24). A PC with another Node.js major stops here with what to do, naming the
-       winget id that carries 24 today. Upgrades npm when it is older than 11.10 (package.json
+       26, the major package.json pins (winget's OpenJS.NodeJS.26, or OpenJS.NodeJS.LTS while that
+       still is 26). A PC with another Node.js major stops here with what to do, naming the
+       winget id that carries 26 today. Upgrades npm when it is older than 11.10 (package.json
        requires it).
     2. Gets the code: when this script runs from a Portly checkout it uses that checkout;
        otherwise (for example `irm <url> | iex`) it clones -RepoUrl into -InstallDir and runs
@@ -72,7 +72,7 @@
 
 .PARAMETER DryRun
     Print what would happen and change nothing. When winget is present and Node.js is missing
-    (or another major), it still asks winget, read-only, which package carries Node.js 24, so
+    (or another major), it still asks winget, read-only, which package carries Node.js 26, so
     the plan and the message name the id that works today.
 
 .EXAMPLE
@@ -102,11 +102,11 @@ param(
     [switch]$DryRun
 )
 
-# Node.js 24: the major package.json pins in engines.node, which npm's engine-strict enforces, so
+# Node.js 26: the major package.json pins in engines.node, which npm's engine-strict enforces, so
 # this script and lib\Common.ps1's Resolve-PtNode refuse any other major too. check-scripts.ps1
 # keeps $SetupNodeMajor equal to $PortlyNodeMajor in lib\Common.ps1; this script cannot dot-source
 # that file because it also runs on its own, before any checkout exists.
-$SetupNodeMajor = 24
+$SetupNodeMajor = 26
 # winget's packages that install that major, tried in this order: winget gives a major its own
 # id (OpenJS.NodeJS.22, ...) once it is no longer winget's LTS; until then OpenJS.NodeJS.LTS is
 # the one that installs it, and it is used only while its version still is that major.
