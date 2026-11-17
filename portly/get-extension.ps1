@@ -299,7 +299,7 @@ function Invoke-ExtMain {
     $previous = "$dest.previous"
     $release = Join-Path $env:LOCALAPPDATA 'Programs\Portly\app\extension'
     if ([string]::Equals($release, $dest, [System.StringComparison]::OrdinalIgnoreCase)) {
-        throw "$dest belongs to the Portly install on this PC; portly --update keeps it up to date. Pass -Destination with another folder."
+        throw "$dest belongs to the Portly install on this PC; portly update keeps it up to date. Pass -Destination with another folder."
     }
 
     $installed = $null

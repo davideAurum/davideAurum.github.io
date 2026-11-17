@@ -21,7 +21,7 @@
     5. npm run build (web\dist, the page the server serves).
     6. scripts\install-autostart.ps1: the Portly Server scheduled task and the native host the
        new-tab extension uses to start it; starts Portly and waits for /api/health.
-    7. scripts\install-cli.ps1: the `portly` command (portly --status, --rebuild, ...).
+    7. scripts\install-cli.ps1: the `portly` command (portly status, update, ...).
     8. The new-tab extension cannot be installed by a script (Chrome and Edge only load unpacked
        extensions by hand): prints the steps, copies the extension folder's path to the clipboard
        and opens the browser's extensions page. New tabs follow Portly on this PC: its Pages
@@ -524,7 +524,7 @@ function Invoke-SetupFromClone {
         $commit = Get-SetupCheckoutCommit -Path $target
         if ($null -ne $commit) { Write-SetupInfo "Its code: $commit" }
         Write-SetupInfo "To set up the newest code instead: git -C ""$target"" pull, then run setup again."
-        Write-SetupInfo "To update it later: git -C ""$target"" pull, then portly --rebuild."
+        Write-SetupInfo "To update it later: git -C ""$target"" pull, then portly update."
     } elseif ((Test-Path -LiteralPath $target) -and @(Get-ChildItem -LiteralPath $target -Force).Count -gt 0) {
         throw "$target exists and is not an empty folder or a Portly checkout. Pass -InstallDir with another folder."
     } else {
@@ -642,7 +642,7 @@ function Invoke-SetupHere {
     if ($DryRun) { Write-SetupOk 'Dry run finished; nothing was changed.'; return 0 }
     Write-SetupOk 'Portly is set up: http://localhost:5757'
     Write-SetupInfo 'Then connect your accounts in Settings (docs\SETUP.md#connect-your-accounts).'
-    Write-SetupInfo 'Open a new terminal to use the portly command (portly --status).'
+    Write-SetupInfo 'Open a new terminal to use the portly command (portly status).'
     return 0
 }
 

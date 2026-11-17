@@ -41,7 +41,7 @@
 
     Your data (%LOCALAPPDATA%\Portly, or PORTLY_DATA_DIR) is never moved or deleted.
     Self-contained, so it also runs as `irm <url> | iex` before anything is installed; installed
-    copies run it for `portly --update`. See docs\setup\releases.md.
+    copies run it for `portly update`. See docs\setup\releases.md.
 
 .PARAMETER InstallDir
     Where Portly is installed (default %LOCALAPPDATA%\Programs\Portly). The program lives in
@@ -606,7 +606,7 @@ function Restore-InstPrevious {
     }
     if ($Task.Ours -and -not $SkipAutostart) {
         if ((Invoke-InstAutostart -AppDir $app -Mode $Mode) -ne 0) {
-            Write-InstFailure 'The previous version did not start either; see the output above (portly --status --logs).'
+            Write-InstFailure 'The previous version did not start either; see the output above (portly status --logs).'
             return $false
         }
     }
